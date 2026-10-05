@@ -6,8 +6,9 @@
 //
 // Held with the M5 button on the right, the side button is on top and the
 // power button at the bottom. M5: hold to ask, click for the home screen. Top: click scrolls up, hold
-// 1 s opens the Wi-Fi menu. Bottom: click scrolls down, hold 1.2 s shows the info
-// screen, hold 5 s powers off.
+// 1 s opens the Wi-Fi menu. Bottom: click scrolls down, hold 1 s shows the info
+// screen, about 2.2 s powers off. While a question is being answered, three
+// quick M5 taps cancel it.
 //
 // The UI runs in loop() at about 30 fps. Network requests run in a separate
 // task so the animations keep moving while it waits.
@@ -83,6 +84,10 @@ enum Stage { ST_IDLE, ST_TRANSCRIBE, ST_SEARCH, ST_THINK, ST_DONE, ST_ERROR };
 static std::atomic<int> stage{ST_IDLE};
 // Written by the network task before it publishes the stage that exposes them.
 enum Job { JOB_CONNECT, JOB_JOIN, JOB_ASK };
+// Each question gets a number. Cancelling bumps it, so a question still in
+// flight sees it's been cancelled and drops its results.
+static std::atomic<uint32_t> jobSeq{0};
+static uint32_t runningJob = 0;  // network task only
 static std::atomic<int> job{JOB_CONNECT};
 static std::atomic<bool> netBusy{false};
 static std::atomic<int> connectResult{0};  // 0 pending, 1 connected, 2 failed
@@ -150,9 +155,10 @@ static Screen screenBeforeWifi = Screen::Home;
 // Info screen
 static Screen infoReturn = Screen::Home;
 static uint32_t infoUntil = 0;
-// The bottom (power) button opens the info screen after 1.2 s and powers off
-// at 5 s, before the stick's own hardware cut-off at 6 s.
-static const uint32_t INFO_MS = 5000, INFO_HOLD_MS = 1200, POWER_OFF_MS = 5000;
+// The bottom (power) button opens the info screen after 1 s. The Plus2's power
+// circuit cuts power when that button is held for about 2.5 s (measured; the
+// label says 6 s), so Jarvis shuts down cleanly just before that.
+static const uint32_t INFO_MS = 5000, INFO_HOLD_MS = 1000, POWER_OFF_MS = 2200;
 static const uint32_t TOP_HOLD_MS = 1000;  // top button: Wi-Fi menu
 static Preferences prefs;
 
@@ -408,12 +414,8 @@ static void drawHome()
 
   canvas.setTextColor(MUTED);
   canvas.drawString("Hold M5 to ask me", x, 98);
-  // The second line cycles through the other buttons' jobs.
-  const char *hints[] = {"Hold top: Wi-Fi", "Hold bottom: info", "Tap: last answer"};
-  int count = haveAnswer ? 3 : 2;
-  int h = (millis() / 3000) % count;
-  canvas.setTextColor(h == 2 ? ACCENT : MUTED);
-  canvas.drawString(hints[h], x, 113);
+  canvas.setTextColor(haveAnswer ? ACCENT : MUTED);
+  canvas.drawString(haveAnswer ? "Tap M5: last answer" : "Hold top: Wi-Fi", x, 113);
 }
 
 static void drawListening()
@@ -464,7 +466,7 @@ static void drawWorking()
     canvas.setTextColor(MUTED);
     canvas.setTextDatum(top_left);
     for (size_t i = 0; i < lines.size(); i++) canvas.drawString(lines[i], 14, BAR_H + 9 + i * 15);
-    dotsY = BAR_H + 4 + boxH + 30;
+    dotsY = BAR_H + 4 + boxH + 22;
   }
 
   float t = seconds();
@@ -479,7 +481,12 @@ static void drawWorking()
   canvas.setFont(FONT_BODY);
   canvas.setTextColor(TEXT);
   canvas.setTextDatum(top_center);
-  canvas.drawString(label, W / 2, dotsY + 16);
+  canvas.drawString(label, W / 2, dotsY + 13);
+
+  canvas.setFont(FONT_SMALL);
+  canvas.setTextColor(MUTED);
+  canvas.setTextDatum(bottom_center);
+  canvas.drawString("Tap M5 3x to cancel", W / 2, H - 2);
 }
 
 static const int VIEW_TOP = BAR_H + 2;
@@ -1114,8 +1121,17 @@ static int groqChat(const String &question, const String &results, String &answe
 
 // ---- Network task ----
 
+static bool cancelled() { return jobSeq.load() != runningJob; }
+
+// Publishes progress for the current question, unless it was cancelled.
+static void publish(Stage st)
+{
+  if (!cancelled()) stage.store(st, std::memory_order_release);
+}
+
 static void fail(const String &title, const String &text)
 {
+  if (cancelled()) return;
   jobErrorTitle = title;
   jobError = text;
   stage.store(ST_ERROR, std::memory_order_release);
@@ -1123,6 +1139,7 @@ static void fail(const String &title, const String &text)
 
 static void runJob()
 {
+  runningJob = jobSeq.load();
   if (WiFi.status() != WL_CONNECTED && !connectWifi(15000)) {
     fail("No Wi-Fi", "None of your saved networks are in range.");
     return;
@@ -1143,9 +1160,10 @@ static void runJob()
     fail("No words heard", "Speak a little closer to the stick and try again.");
     return;
   }
+  if (cancelled()) return;
   Serial.printf("Q: %s\n", question.c_str());
   jobQuestion = question;
-  stage.store(ST_SEARCH, std::memory_order_release);
+  publish(ST_SEARCH);
 
   // Search first; if that fails, answer from the model's own knowledge and
   // tag the answer "no web".
@@ -1156,7 +1174,8 @@ static void runJob()
     int code = tavilySearch(question, results, err);
     if (code != 200) Serial.printf("Search failed: %s\n", err.c_str());
   }
-  stage.store(ST_THINK, std::memory_order_release);
+  if (cancelled()) return;
+  publish(ST_THINK);
 
   int code = groqChat(question, results, answer, err);
   if (code == 429) {
@@ -1170,10 +1189,11 @@ static void runJob()
     fail(code == 401 ? "Bad API key" : "No answer", err);
     return;
   }
+  if (cancelled()) return;
   Serial.printf("A (%s): %s\n", results.isEmpty() ? "no web" : "web", answer.c_str());
   jobAnswer = answer;
   jobSearched = !results.isEmpty();
-  stage.store(ST_DONE, std::memory_order_release);
+  publish(ST_DONE);
 }
 
 static void netTaskMain(void *)
@@ -1242,7 +1262,8 @@ static void finishListening()
   M5.Mic.end();
 
   if (recSamples < MIN_SAMPLES) {  // a click, not a question
-    setScreen(Screen::Home);
+    // On the home screen a tap opens the last answer; everywhere else it goes home.
+    setScreen(screenBeforeListening == Screen::Home && haveAnswer ? Screen::Answer : Screen::Home);
     return;
   }
   if (!normalize(recSamples)) {
@@ -1437,6 +1458,25 @@ static void handleButtons()
     return;
   }
 
+  if (screen == Screen::Working) {  // three quick M5 taps cancel the question
+    static int taps = 0;
+    static uint32_t lastTap = 0;
+    if (M5.BtnA.wasClicked()) {
+      if (millis() - lastTap > 800) taps = 0;
+      lastTap = millis();
+      if (++taps >= 3) {
+        taps = 0;
+        jobSeq++;
+        stage.store(ST_IDLE);
+        setScreen(Screen::Home);
+        showToast("Cancelled");
+      } else {
+        showToast(taps == 1 ? "Tap M5 2 more times to cancel" : "Once more to cancel");
+      }
+    }
+    return;
+  }
+
   bool idle = screen == Screen::Home || screen == Screen::Answer || screen == Screen::Error ||
               screen == Screen::Connecting;
   if (idle && top.wasHold()) {
@@ -1575,6 +1615,7 @@ void setup()
   cfg.internal_spk = false;  // the buzzer isn't used
   M5.begin(cfg);
   Serial.begin(115200);
+  Serial.printf("boot: reset reason %d\n", (int)esp_reset_reason());
 
   M5.Display.setRotation(1);
   M5.Display.setBrightness(BRIGHT);

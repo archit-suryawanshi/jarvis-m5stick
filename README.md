@@ -95,9 +95,18 @@ top and the power button at the bottom.
 |---|---|---|
 | M5 | Home screen | Talk (in the Wi-Fi menu: join) |
 | Top | Scroll up (Wi-Fi menu: move up) | 1 s: Wi-Fi menu (in the menu: back) |
-| Bottom | Scroll down (Wi-Fi menu: move down) | 1.2 s: info screen. 5 s: power off |
+| Bottom | Scroll down (Wi-Fi menu: move down) | 1 s: info screen. About 2.2 s: power off |
 
-On the home screen, a top or bottom click reopens the last answer.
+On the home screen, a tap on M5 (or a top or bottom click) reopens the last
+answer.
+
+Asked the wrong thing, or Whisper misheard you? While Jarvis is searching,
+**tap M5 three times quickly** to cancel and go back home.
+
+The bottom button is the Plus2's power button, and its hardware cuts the power
+when it's held for about 2.5 seconds. So after the info screen opens, a red
+countdown shows how long is left, and Jarvis shuts down cleanly just before
+the hardware would. Let go any time before that to stay on.
 
 ## Free plan limits
 
