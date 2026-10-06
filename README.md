@@ -10,7 +10,12 @@ that happened this week, and it runs entirely on free API plans.
   <img src="docs/screenshots/listen.png" width="240" alt="Listening, with a live waveform">
   <img src="docs/screenshots/work.png" width="240" alt="Searching the web">
   <img src="docs/screenshots/answer.png" width="240" alt="An answer under the question">
+  <img src="docs/screenshots/error.png" width="240" alt="An error, with the robot's X eyes">
 </p>
+
+Jarvis has a face: a little pixel-art robot that bobs and blinks on the home
+screen, perks up with wide eyes while you talk, glances around while it
+searches, and shows X eyes when something goes wrong.
 
 No extra hardware: it uses the stick's own microphone, screen, buttons and
 battery.

@@ -27,6 +27,7 @@
 
 #include "certs.h"
 #include "secrets.h"
+#include "avatar.h"
 
 #ifndef WIFI_OPEN
 #define WIFI_OPEN nullptr
@@ -67,7 +68,6 @@ static const uint16_t SURFACE = rgb(30, 34, 46);
 static const uint16_t TEXT = rgb(236, 238, 242);
 static const uint16_t MUTED = rgb(140, 148, 166);
 static const uint16_t ACCENT = rgb(255, 138, 61);
-static const uint16_t ACCENT_DIM = rgb(120, 64, 30);
 static const uint16_t DANGER = rgb(255, 92, 92);
 
 static const lgfx::IFont *FONT_SMALL = &fonts::DejaVu12;
@@ -306,14 +306,6 @@ static std::vector<String> wrapClamped(const String &text, const lgfx::IFont *fo
 
 static String fitText(String text, int maxW);
 
-static void drawMic(int cx, int cy, uint16_t color)
-{
-  canvas.fillSmoothRoundRect(cx - 6, cy - 16, 13, 20, 6, color);  // capsule
-  canvas.fillArc(cx, cy - 3, 9, 11, 0, 180, color);                // holder
-  canvas.fillRect(cx - 1, cy + 8, 3, 5, color);                    // stem
-  canvas.fillSmoothRoundRect(cx - 6, cy + 12, 13, 3, 1, color);    // base
-}
-
 static void drawStatusBar()
 {
   canvas.setFont(FONT_SMALL);
@@ -375,31 +367,30 @@ static float seconds() { return millis() / 1000.0f; }
 
 static void drawConnecting()
 {
-  canvas.setFont(FONT_TITLE);
+  drawAvatar(canvas, 0, 20, Mood::Sleepy);
+
+  int x = 100;
+  canvas.setTextDatum(top_left);
+  canvas.setFont(FONT_SUBTITLE);
   canvas.setTextColor(TEXT);
-  canvas.setTextDatum(top_center);
-  canvas.drawString("Jarvis", W / 2, 26);
-
-  int cx = W / 2, cy = 80;
-  float a = fmodf(seconds() * 360.0f, 360.0f);
-  canvas.fillArc(cx, cy, 13, 17, 0, 360, SURFACE);
-  canvas.fillArc(cx, cy, 13, 17, a, min(a + 100, 360.0f), ACCENT);
-  if (a + 100 > 360) canvas.fillArc(cx, cy, 13, 17, 0, a + 100 - 360, ACCENT);
-
+  canvas.drawString("Waking up", x, 40);
   canvas.setFont(FONT_SMALL);
   canvas.setTextColor(MUTED);
-  canvas.drawString(connectingLabel, W / 2, 106);
+  auto lines = wrapClamped(connectingLabel, FONT_SMALL, W - x - 4, 2);
+  for (size_t i = 0; i < lines.size(); i++) canvas.drawString(lines[i], x, 66 + i * 13);
+
+  int cx = x + 8, cy = 108;
+  float a = fmodf(seconds() * 360.0f, 360.0f);
+  canvas.fillArc(cx, cy, 5, 7, 0, 360, SURFACE);
+  canvas.fillArc(cx, cy, 5, 7, a, min(a + 100, 360.0f), ACCENT);
+  if (a + 100 > 360) canvas.fillArc(cx, cy, 5, 7, 0, a + 100 - 360, ACCENT);
 }
 
 static void drawHome()
 {
-  int cx = 50, cy = 76;
-  float breathe = (sinf(seconds() * 2.2f) + 1) / 2;  // 0..1
-  canvas.fillSmoothCircle(cx, cy, 30 + (int)(breathe * 3), ACCENT_DIM);
-  canvas.fillSmoothCircle(cx, cy, 28, SURFACE);
-  drawMic(cx, cy + 1, ACCENT);
+  drawAvatar(canvas, 0, 20, Mood::Idle);
 
-  int x = 94;
+  int x = 100;
   canvas.setTextDatum(top_left);
   canvas.setFont(FONT_BODY);
   canvas.setTextColor(MUTED);
@@ -420,13 +411,9 @@ static void drawHome()
 
 static void drawListening()
 {
-  int cx = 50, cy = 76;
-  int ring = 30 + (int)(level * 16);
-  canvas.fillSmoothCircle(cx, cy, ring, ACCENT_DIM);
-  canvas.fillSmoothCircle(cx, cy, 28, ACCENT);
-  drawMic(cx, cy + 1, BG);
+  drawAvatar(canvas, 0, 20, Mood::Listening, level);
 
-  int x = 96;
+  int x = 100;
   canvas.setTextDatum(top_left);
   canvas.setFont(FONT_SUBTITLE);
   canvas.setTextColor(ACCENT);
@@ -438,7 +425,7 @@ static void drawListening()
   canvas.setFont(FONT_SMALL);
   canvas.setTextColor(MUTED);
   canvas.setTextDatum(top_right);
-  canvas.drawString(timer, W - 8, 27);
+  canvas.drawString(timer, W - 6, 27);
 
   // Waveform, newest on the right
   const int n = sizeof(levels) / sizeof(levels[0]);
@@ -448,7 +435,7 @@ static void drawListening()
     canvas.fillSmoothRoundRect(x + i * 6, mid - h / 2, 4, h, 2, i == n - 1 ? ACCENT : TEXT);
   }
 
-  int pw = W - 8 - x;
+  int pw = W - 6 - x;
   canvas.fillSmoothRoundRect(x, 100, pw, 4, 2, SURFACE);
   canvas.fillSmoothRoundRect(x, 100, max(4, (int)(pw * recSamples / MAX_SAMPLES)), 4, 2, ACCENT);
   canvas.setTextDatum(top_left);
@@ -457,36 +444,39 @@ static void drawListening()
 
 static void drawWorking()
 {
+  drawAvatar(canvas, 0, 20, Mood::Thinking);
+
   int st = stage.load(std::memory_order_acquire);
-  int dotsY = 70;
+  const int x = 100, colW = W - x - 4, cx = x + colW / 2;
+  int dotsY = 62;
   if (st >= ST_SEARCH) {
-    auto lines = wrapClamped(toAscii(jobQuestion.c_str()), FONT_SMALL, W - 28, 2);
-    int boxH = lines.size() * 15 + 8;
-    canvas.fillSmoothRoundRect(6, BAR_H + 4, W - 12, boxH, 7, SURFACE);
+    auto lines = wrapClamped(toAscii(jobQuestion.c_str()), FONT_SMALL, colW - 14, 3);
+    int boxH = lines.size() * 14 + 8;
+    canvas.fillSmoothRoundRect(x, BAR_H + 4, colW, boxH, 7, SURFACE);
     canvas.setTextColor(MUTED);
     canvas.setTextDatum(top_left);
-    for (size_t i = 0; i < lines.size(); i++) canvas.drawString(lines[i], 14, BAR_H + 9 + i * 15);
-    dotsY = BAR_H + 4 + boxH + 22;
+    for (size_t i = 0; i < lines.size(); i++) canvas.drawString(lines[i], x + 7, BAR_H + 9 + i * 14);
+    dotsY = BAR_H + 4 + boxH + 18;
   }
 
   float t = seconds();
   for (int i = 0; i < 3; i++) {
     float bounce = fabsf(sinf(t * 5.0f - i * 0.8f));
-    canvas.fillSmoothCircle(W / 2 - 18 + i * 18, dotsY - (int)(bounce * 8), 5, i == 1 ? TEXT : ACCENT);
+    canvas.fillSmoothCircle(cx - 14 + i * 14, dotsY - (int)(bounce * 6), 4, i == 1 ? TEXT : ACCENT);
   }
 
-  const char *label = st == ST_TRANSCRIBE ? "Listening back..."
-                    : st == ST_SEARCH ? "Searching the web"
+  const char *label = st == ST_TRANSCRIBE ? "Listening back"
+                    : st == ST_SEARCH ? "Searching"
                     : "Thinking";
   canvas.setFont(FONT_BODY);
   canvas.setTextColor(TEXT);
   canvas.setTextDatum(top_center);
-  canvas.drawString(label, W / 2, dotsY + 13);
+  canvas.drawString(fitText(label, colW), cx, dotsY + 10);
 
   canvas.setFont(FONT_SMALL);
   canvas.setTextColor(MUTED);
   canvas.setTextDatum(bottom_center);
-  canvas.drawString("Tap M5 3x to cancel", W / 2, H - 2);
+  canvas.drawString("Tap M5 3x to cancel", cx, H - 2);
 }
 
 static const int VIEW_TOP = BAR_H + 2;
@@ -541,26 +531,32 @@ static void drawAnswer()
 
 static void drawError()
 {
-  int cx = 38, cy = 72;
-  canvas.fillSmoothCircle(cx, cy, 20, DANGER);
-  canvas.fillSmoothRoundRect(cx - 2, cy - 11, 5, 14, 2, BG);
-  canvas.fillSmoothCircle(cx, cy + 8, 3, BG);
+  drawAvatar(canvas, 0, 20, Mood::Error);
 
-  int x = 72;
+  int x = 100, colW = W - x - 4;
   canvas.setTextDatum(top_left);
   canvas.setFont(FONT_SUBTITLE);
   canvas.setTextColor(TEXT);
-  canvas.drawString(errorTitle, x, 26);
+  auto title = wrapClamped(errorTitle, FONT_SUBTITLE, colW, 2);
+  int y = 24;
+  for (auto &l : title) {
+    canvas.drawString(l, x, y);
+    y += 18;
+  }
+  y += 4;
+
   canvas.setFont(FONT_SMALL);
   canvas.setTextColor(MUTED);
-  auto lines = wrapClamped(errorText, FONT_SMALL, W - x - 8, errorIsWifi ? 3 : 5);
-  for (size_t i = 0; i < lines.size(); i++) canvas.drawString(lines[i], x, 50 + i * 14);
+  int bottom = errorIsWifi ? 103 : 117;
+  auto lines = wrapClamped(errorText, FONT_SMALL, colW, max(1, (bottom - y) / 13));
+  for (size_t i = 0; i < lines.size(); i++) canvas.drawString(lines[i], x, y + i * 13);
+
   canvas.setTextColor(ACCENT);
   if (errorIsWifi) {
     canvas.drawString("Hold M5: try again", x, 105);
     canvas.drawString("Hold top: Wi-Fi", x, 119);
   } else {
-    canvas.drawString("Hold M5 to try again", x, 119);
+    canvas.drawString("Hold M5: try again", x, 119);
   }
 }
 
