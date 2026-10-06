@@ -99,7 +99,7 @@ static bool jobSearched;
 static TaskHandle_t netTask;
 
 // ---- UI state ----
-enum class Screen { Connecting, Home, Listening, Working, Answer, Error, Wifi, Info, Bye };
+enum class Screen { Connecting, Home, Listening, Working, Celebrate, Answer, Error, Wifi, Info, Bye };
 static Screen screen = Screen::Connecting;
 static Screen screenBeforeListening = Screen::Home;
 static uint32_t screenSince = 0;
@@ -117,6 +117,8 @@ static Backlight backlight = Backlight::On;
 static bool swallowPress = false;
 static const uint8_t BRIGHT = 160, DIM = 48;
 static bool haveAnswer = false;
+static uint32_t celebrateUntil = 0;
+static const uint32_t CELEBRATE_MS = 1600;  // the happy dance before an answer
 static bool answerSearched = true;
 
 // Recording
@@ -529,6 +531,19 @@ static void drawAnswer()
   }
 }
 
+static void drawCelebrate()
+{
+  drawAvatar(canvas, 0, 20, Mood::Happy);
+  int x = 100;
+  canvas.setTextDatum(top_left);
+  canvas.setFont(FONT_TITLE);
+  canvas.setTextColor(TEXT);
+  canvas.drawString("Got it!", x, 50);
+  canvas.setFont(FONT_SMALL);
+  canvas.setTextColor(MUTED);
+  canvas.drawString(answerSearched ? "Fresh from the web" : "From memory", x, 80);
+}
+
 static void drawError()
 {
   drawAvatar(canvas, 0, 20, Mood::Error);
@@ -793,6 +808,7 @@ static void render()
     case Screen::Home: drawHome(); break;
     case Screen::Listening: drawListening(); break;
     case Screen::Working: drawWorking(); break;
+    case Screen::Celebrate: drawCelebrate(); break;
     case Screen::Answer: drawAnswer(); break;
     case Screen::Error: drawError(); break;
     case Screen::Wifi: drawWifiMenu(); break;
@@ -928,21 +944,68 @@ static bool normalize(size_t n)
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 static void put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 
-static void writeWavHeader(uint8_t *h, size_t samples)
+// G.711 mu-law: 8 bits per sample, half the upload of 16-bit PCM. Whisper
+// transcribes it just as well (tested against the same recording).
+static uint8_t muLaw(int16_t sample)
 {
-  uint32_t dataLen = samples * 2;
+  const int BIAS = 0x84, CLIP = 32635;
+  int v = sample;
+  int sign = v < 0 ? 0x80 : 0;
+  if (v < 0) v = -v;
+  if (v > CLIP) v = CLIP;
+  v += BIAS;
+  int exponent = 7;
+  for (int mask = 0x4000; exponent > 0 && !(v & mask); exponent--, mask >>= 1) {}
+  int mantissa = (v >> (exponent + 3)) & 0x0F;
+  return ~(sign | (exponent << 4) | mantissa);
+}
+
+static const size_t MULAW_HEADER = 58;  // RIFF, fmt (18 bytes), fact and data headers
+
+static void writeMuLawHeader(uint8_t *h, size_t samples)
+{
   memcpy(h, "RIFF", 4);
-  put32(h + 4, 36 + dataLen);
+  put32(h + 4, MULAW_HEADER - 8 + samples);
   memcpy(h + 8, "WAVEfmt ", 8);
-  put32(h + 16, 16);
-  put16(h + 20, 1);  // PCM
+  put32(h + 16, 18);
+  put16(h + 20, 7);  // mu-law
   put16(h + 22, 1);  // mono
   put32(h + 24, SAMPLE_RATE);
-  put32(h + 28, SAMPLE_RATE * 2);
-  put16(h + 32, 2);
-  put16(h + 34, 16);
-  memcpy(h + 36, "data", 4);
-  put32(h + 40, dataLen);
+  put32(h + 28, SAMPLE_RATE);  // one byte per sample
+  put16(h + 32, 1);
+  put16(h + 34, 8);
+  put16(h + 36, 0);
+  memcpy(h + 38, "fact", 4);
+  put32(h + 42, 4);
+  put32(h + 46, samples);
+  memcpy(h + 50, "data", 4);
+  put32(h + 54, samples);
+}
+
+// Finds where speech starts and ends, so the quiet before and after isn't
+// uploaded. Keeps a little margin on both sides.
+static void speechBounds(size_t n, size_t &from, size_t &to)
+{
+  const size_t frame = SAMPLE_RATE / 50;  // 20 ms
+  size_t frames = n / frame;
+  from = 0;
+  to = n;
+  if (frames < 10) return;
+  float peak = 0;
+  static float rms[MAX_SAMPLES / (SAMPLE_RATE / 50) + 1];
+  for (size_t f = 0; f < frames; f++) {
+    double sum = 0;
+    for (size_t i = f * frame; i < (f + 1) * frame; i++) sum += (double)pcm[i] * pcm[i];
+    rms[f] = sqrtf(sum / frame);
+    peak = max(peak, rms[f]);
+  }
+  float threshold = max(peak * 0.12f, 300.0f);
+  size_t first = 0, last = frames - 1;
+  while (first < frames && rms[first] < threshold) first++;
+  while (last > first && rms[last] < threshold) last--;
+  if (first >= frames) return;  // nothing stood out: send it all
+  from = (first > 10 ? first - 10 : 0) * frame;                    // 200 ms before
+  to = min(n, (last + 16) * frame);                                // 300 ms after
 }
 
 // ---- Speech-to-text (Whisper on Groq) ----
@@ -959,32 +1022,59 @@ static bool transcribe(size_t samples, String &text, String &err)
   pre += "Content-Type: audio/wav\r\n\r\n";
   String post = String("\r\n--") + BOUNDARY + "--\r\n";
 
-  uint8_t *wav = uploadBuf + PRE_ROOM;
-  writeWavHeader(wav, samples);
+  // Trim the silence, then encode in place: byte i of the mu-law data is
+  // written over sample i's two bytes or earlier, so nothing unread is lost.
+  size_t from, to;
+  speechBounds(samples, from, to);
+  uint8_t *data = (uint8_t *)pcm;
+  size_t count = to - from;
+  for (size_t i = 0; i < count; i++) data[i] = muLaw(pcm[from + i]);
+
+  uint8_t *wav = data - MULAW_HEADER;
+  writeMuLawHeader(wav, count);
   uint8_t *body = wav - pre.length();
   memcpy(body, pre.c_str(), pre.length());
-  uint8_t *end = wav + WAV_HEADER + samples * 2;
+  uint8_t *end = data + count;
   memcpy(end, post.c_str(), post.length());
   size_t bodyLen = (end + post.length()) - body;
+  Serial.printf("Uploading %.1f s of %.1f s recorded, %u bytes\n", count / (float)SAMPLE_RATE,
+                samples / (float)SAMPLE_RATE, (unsigned)bodyLen);
 
-  WiFiClientSecure tls;
-  tls.setCACert(CA_PEM);
-  HTTPClient http;
-  http.setTimeout(30000);
-  if (!http.begin(tls, "https://api.groq.com/openai/v1/audio/transcriptions")) {
-    err = "Couldn't reach Groq.";
-    return false;
+  // A connection that drops before Groq replies (weak Wi-Fi, a busy network)
+  // is retried once; Groq's own errors are not.
+  int code = 0;
+  String resp;
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    WiFiClientSecure tls;
+    tls.setCACert(CA_PEM);
+    HTTPClient http;
+    http.setTimeout(30000);
+    if (!http.begin(tls, "https://api.groq.com/openai/v1/audio/transcriptions")) {
+      err = "Couldn't reach Groq.";
+      return false;
+    }
+    http.addHeader("Authorization", String("Bearer ") + GROQ_API_KEY);
+    http.addHeader("Content-Type", String("multipart/form-data; boundary=") + BOUNDARY);
+    uint32_t t0 = millis();
+    code = http.POST(body, bodyLen);
+    resp = code > 0 ? http.getString() : "";
+    http.end();
+    if (code > 0) break;
+    char tlsErr[96] = "";
+    tls.lastError(tlsErr, sizeof(tlsErr));
+    Serial.printf("Upload attempt %d failed: %d (%s) after %lu ms, %u bytes, RSSI %d, free heap %u, largest block %u\n",
+                  attempt, code, HTTPClient::errorToString(code).c_str(), (unsigned long)(millis() - t0),
+                  (unsigned)bodyLen, WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    err = HTTPClient::errorToString(code);
+    if (tlsErr[0]) err += String(": ") + tlsErr;
   }
-  http.addHeader("Authorization", String("Bearer ") + GROQ_API_KEY);
-  http.addHeader("Content-Type", String("multipart/form-data; boundary=") + BOUNDARY);
-  int code = http.POST(body, bodyLen);
-  String resp = code > 0 ? http.getString() : "";
-  http.end();
 
   JsonDocument doc;
   deserializeJson(doc, resp);
   if (code != 200) {
-    err = "Speech-to-text failed (" + String(code) + "). " + (const char *)(doc["error"]["message"] | "");
+    if (code < 0) err = "Lost the connection while sending your question (" + err + "). Wi-Fi signal: " + String(WiFi.RSSI()) + " dBm.";
+    else err = "Speech-to-text failed (" + String(code) + "). " + (const char *)(doc["error"]["message"] | "");
     return false;
   }
   text = (const char *)(doc["text"] | "");
@@ -1136,6 +1226,7 @@ static void fail(const String &title, const String &text)
 static void runJob()
 {
   runningJob = jobSeq.load();
+  WiFi.setSleep(false);  // power save slows uploads a lot; netTaskMain turns it back on
   if (WiFi.status() != WL_CONNECTED && !connectWifi(15000)) {
     fail("No Wi-Fi", "None of your saved networks are in range.");
     return;
@@ -1210,6 +1301,7 @@ static void netTaskMain(void *)
       }
       default:
         runJob();
+        WiFi.setSleep(true);  // back to saving battery between questions
     }
     netBusy.store(false);
   }
@@ -1454,6 +1546,11 @@ static void handleButtons()
     return;
   }
 
+  if (screen == Screen::Celebrate) {  // any button skips the dance
+    if (M5.BtnA.wasPressed() || top.wasPressed() || bottom.wasPressed()) setScreen(Screen::Answer);
+    return;
+  }
+
   if (screen == Screen::Working) {  // three quick M5 taps cancel the question
     static int taps = 0;
     static uint32_t lastTap = 0;
@@ -1569,6 +1666,10 @@ static void showSample(const String &name)
                  "Building in New York was finished in 1930.");
     haveAnswer = true;
     setScreen(Screen::Answer);
+  } else if (name == "happy") {
+    answerSearched = true;
+    setScreen(Screen::Celebrate);
+    celebrateUntil = millis() + 60000;  // hold it for the screenshot
   } else if (name == "info") {
     openInfo();
     infoUntil = millis() + 60000;  // hold it for the screenshot
@@ -1592,6 +1693,20 @@ static void handleSerial()
     if (cmd == "shot") {
       render();
       dumpScreen();
+    } else if (cmd.startsWith("nettest")) {
+      // "nettest N": uploads N seconds of quiet audio to Groq, as a question would.
+      int secs = constrain(cmd.length() > 8 ? (int)cmd.substring(8).toInt() : 4, 1, 15);
+      size_t n = SAMPLE_RATE * secs;
+      for (size_t i = 0; i < n; i++) pcm[i] = (int16_t)((esp_random() % 64) - 32);
+      String text, err;
+      WiFi.setSleep(cmd.indexOf("sleep") < 0);  // "nettest N sleep" measures with power save on
+      uint32_t t0 = millis();
+      bool ok = transcribe(n, text, err);
+      WiFi.setSleep(true);
+      Serial.printf("nettest %ds: %s in %lu ms | RSSI %d | heap %u, largest %u | %s\n", secs, ok ? "OK" : "FAILED",
+                    (unsigned long)(millis() - t0), WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    ok ? text.c_str() : err.c_str());
     } else if (cmd == "wifi") {
       Serial.printf("scan: scanning=%d complete=%d listed=%u netBusy=%d sinceScan=%lu status=%d\n",
                     scanning, WiFi.scanComplete(), (unsigned)scanList.size(), netBusy.load(),
@@ -1651,6 +1766,7 @@ void loop()
 
   if (screen == Screen::Listening && !sampleListening) updateListening();
   if (screen == Screen::Wifi) pollScan();
+  if (screen == Screen::Celebrate && millis() > celebrateUntil) setScreen(Screen::Answer);
   if (screen == Screen::Info && millis() > infoUntil && !M5.BtnPWR.isPressed()) setScreen(infoReturn);
 
   if (screen == Screen::Connecting) {
@@ -1674,7 +1790,8 @@ void loop()
       answerSearched = jobSearched;
       haveAnswer = true;
       stage.store(ST_IDLE);
-      setScreen(Screen::Answer);
+      setScreen(Screen::Celebrate);
+      celebrateUntil = millis() + CELEBRATE_MS;
       wake();
     } else if (st == ST_ERROR) {
       stage.store(ST_IDLE);
@@ -1683,7 +1800,8 @@ void loop()
     }
   }
 
-  updateBacklight(screen == Screen::Listening || screen == Screen::Working || screen == Screen::Connecting);
+  updateBacklight(screen == Screen::Listening || screen == Screen::Working || screen == Screen::Connecting ||
+                  screen == Screen::Celebrate);
 
   static uint32_t lastFrame = 0;
   uint32_t frameMs = backlight == Backlight::On ? 33 : 500;

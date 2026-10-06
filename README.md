@@ -9,13 +9,15 @@ that happened this week, and it runs entirely on free API plans.
   <img src="docs/screenshots/home.png" width="240" alt="Home screen: Hi, I'm JARVIS">
   <img src="docs/screenshots/listen.png" width="240" alt="Listening, with a live waveform">
   <img src="docs/screenshots/work.png" width="240" alt="Searching the web">
+  <img src="docs/screenshots/happy.png" width="240" alt="The happy dance when an answer arrives">
   <img src="docs/screenshots/answer.png" width="240" alt="An answer under the question">
   <img src="docs/screenshots/error.png" width="240" alt="An error, with the robot's X eyes">
 </p>
 
 Jarvis has a face: a little pixel-art robot that bobs and blinks on the home
 screen, perks up with wide eyes while you talk, glances around while it
-searches, and shows X eyes when something goes wrong.
+searches, does a happy dance when the answer arrives, and shows X eyes when
+something goes wrong.
 
 No extra hardware: it uses the stick's own microphone, screen, buttons and
 battery.
@@ -143,6 +145,11 @@ Tavily returns short snippets instead, which brings a question down to about
 - **"Bad API key".** Check the key in `secrets.h` was copied in full, then
   flash again.
 - **"Slow down".** You've hit Groq's per-minute or daily free limit.
+- **"Lost the connection while sending your question".** The Wi-Fi link
+  dropped during the upload, usually from a weak signal. Jarvis already
+  retries once; move closer to the router if it keeps happening. Uploads are
+  kept small (8-bit mu-law audio with the silence trimmed), but a 2.4 GHz
+  signal below about -75 dBm is still unreliable.
 
 ## Restore the factory firmware
 

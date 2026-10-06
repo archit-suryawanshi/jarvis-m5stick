@@ -25,11 +25,13 @@ enum : uint8_t {
   BLUSH,
   SHADOW,
   SHINE,
+  HEART,
   COLOR_COUNT,
 };
 
 uint8_t fb[LW * LH];
-int bobY = 0;  // vertical offset applied by put(), for the idle bob
+int bobY = 0;  // offsets applied by put(), for bobbing and dancing
+int bobX = 0;
 
 constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -37,18 +39,20 @@ constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 }
 
 // Bright, mid and dark glow per mood, in Mood order.
-const float MOOD_RGB[5][3][3] = {
+const float MOOD_RGB[6][3][3] = {
   {{255, 168, 88}, {236, 118, 46}, {120, 58, 24}},     // Idle: Jarvis orange
   {{140, 232, 255}, {58, 170, 240}, {24, 80, 140}},    // Listening: cyan
   {{216, 164, 255}, {158, 100, 240}, {78, 44, 150}},   // Thinking: violet
   {{255, 118, 118}, {226, 58, 70}, {118, 24, 34}},     // Error: red
   {{206, 216, 255}, {146, 160, 228}, {68, 78, 138}},   // Sleepy: pale blue
+  {{150, 248, 170}, {64, 206, 120}, {22, 104, 62}},    // Happy: green
 };
 float glow[3][3];
 bool glowReady = false;
 
 void put(int x, int y, uint8_t c)
 {
+  x += bobX;
   y += bobY;
   if (x >= 0 && x < LW && y >= 0 && y < LH) fb[y * LW + x] = c;
 }
@@ -66,7 +70,7 @@ void rrect(int x0, int y0, int x1, int y1, int r, uint8_t c)
 
 bool solid(uint8_t c)
 {
-  return c != CLEAR && c != OUTLINE && c != SHADOW && c != SHINE;
+  return c != CLEAR && c != OUTLINE && c != SHADOW && c != SHINE && c != HEART;
 }
 
 // Draws an outline on every empty pixel that touches the robot.
@@ -140,6 +144,15 @@ void sparkle(int x, int y, float phase, uint8_t c)
   }
 }
 
+// A 5x4 heart, drawn behind the robot.
+void heart(int x, int y)
+{
+  static const char *rows[] = {".X.X.", "XXXXX", ".XXX.", "..X.."};
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 5; c++)
+      if (rows[r][c] == 'X') under(x + c, y + r, HEART);
+}
+
 uint16_t mix565(const float *c, float k)
 {
   return rgb((uint8_t)fminf(255, c[0] * k), (uint8_t)fminf(255, c[1] * k), (uint8_t)fminf(255, c[2] * k));
@@ -181,9 +194,11 @@ void drawAvatar(M5Canvas &canvas, int ox, int oy, Mood mood, float level)
   int gx = 0, gy = 0;  // gaze
   Eyes eyes = Eyes::Open;
   int armLift = 0;
+  int leftArmUp = 0, rightArmUp = 0;  // dance: raise one arm or the other
   float antenna = 0.5f + 0.5f * sinf(t * 2.0f);  // 0..1 brightness
   float chest = 0.5f + 0.5f * sinf(t * 2.0f + 1.5f);
   bobY = 0;
+  bobX = 0;
   switch (mood) {
     case Mood::Idle:
       bobY = sinf(t * 2.4f) > 0.2f ? -1 : 0;
@@ -214,6 +229,19 @@ void drawAvatar(M5Canvas &canvas, int ox, int oy, Mood mood, float level)
       eyes = Eyes::Sleepy;
       antenna = 0.3f + 0.7f * (0.5f + 0.5f * sinf(t * 1.5f));
       break;
+    case Mood::Happy: {
+      // Four beats: hop left with the left arm up, land, hop right with the
+      // right arm up, land.
+      int beat = (now / 200) % 4;
+      bobY = beat % 2 == 0 ? -2 : 0;
+      bobX = beat < 2 ? -1 : 1;
+      leftArmUp = beat == 0 || beat == 1;
+      rightArmUp = !leftArmUp;
+      eyes = Eyes::Happy;
+      antenna = (now / 100) % 2 ? 1.0f : 0.6f;
+      chest = 1.0f;
+      break;
+    }
   }
 
   // Ears, with a light panel that glows while listening
@@ -247,7 +275,7 @@ void drawAvatar(M5Canvas &canvas, int ox, int oy, Mood mood, float level)
   eye(15 + gx, 17 + gy, eyes);
   eye(28 + gx, 17 + gy, eyes);
 
-  if (mood == Mood::Idle || mood == Mood::Listening) {
+  if (mood == Mood::Idle || mood == Mood::Listening || mood == Mood::Happy) {
     put(13, 24, BLUSH);
     put(14, 24, BLUSH);
     put(33, 24, BLUSH);
@@ -277,6 +305,13 @@ void drawAvatar(M5Canvas &canvas, int ox, int oy, Mood mood, float level)
       put(23, 26, GLOW_MID);
       put(24, 26, GLOW_MID);
       break;
+    case Mood::Happy:  // big open grin
+      for (int x = 21; x <= 26; x++) put(x, 25, GLOW_MID);
+      put(22, 26, GLOW_MID);
+      put(23, 26, BLUSH);
+      put(24, 26, BLUSH);
+      put(25, 26, GLOW_MID);
+      break;
   }
 
   // Neck, body and chest light
@@ -288,13 +323,16 @@ void drawAvatar(M5Canvas &canvas, int ox, int oy, Mood mood, float level)
 
   // Arms (raised a little while listening) and feet
   int sway = mood == Mood::Idle && sinf(t * 1.3f) > 0.7f ? 1 : 0;
-  rrect(8, 36 - armLift, 11, 45 - armLift - sway, 2, SHELL_MID);
-  rrect(36, 36 - armLift - sway, 39, 45 - armLift, 2, SHELL_MID);
+  if (leftArmUp) rrect(7, 26, 10, 35, 2, SHELL_MID);  // waving above the shoulder
+  else rrect(8, 36 - armLift, 11, 45 - armLift - sway, 2, SHELL_MID);
+  if (rightArmUp) rrect(37, 26, 40, 35, 2, SHELL_MID);
+  else rrect(36, 36 - armLift - sway, 39, 45 - armLift, 2, SHELL_MID);
   rrect(15, 48, 21, 51, 1, SHELL_MID);
   rrect(26, 48, 32, 51, 1, SHELL_MID);
 
   outline();
   bobY = 0;
+  bobX = 0;
 
   // Ground shadow: narrower when bobbing up
   int rx = 11;
@@ -303,8 +341,15 @@ void drawAvatar(M5Canvas &canvas, int ox, int oy, Mood mood, float level)
     if (x > 24 - rx + 2 && x < 23 + rx - 2) under(x, 54, SHADOW);
   }
 
-  // Sparkles while idle or thinking
-  if (mood == Mood::Idle || mood == Mood::Thinking) {
+  // Hearts float up while dancing
+  if (mood == Mood::Happy) {
+    int rise = (now / 45) % 18;
+    heart(0, 16 - rise);
+    heart(43, 22 - (rise + 9) % 18);
+  }
+
+  // Sparkles while idle, thinking or dancing
+  if (mood == Mood::Idle || mood == Mood::Thinking || mood == Mood::Happy) {
     sparkle(3, 6, 0.5f + 0.5f * sinf(t * 2.1f), GLOW_MID);
     sparkle(44, 10, 0.5f + 0.5f * sinf(t * 1.7f + 2.0f), GLOW_MID);
     sparkle(43, 44, 0.5f + 0.5f * sinf(t * 2.6f + 4.0f), GLOW_MID);
@@ -325,6 +370,7 @@ void drawAvatar(M5Canvas &canvas, int ox, int oy, Mood mood, float level)
   pal[BLUSH] = rgb(255, 128, 140);
   pal[SHADOW] = rgb(30, 32, 44);
   pal[SHINE] = rgb(255, 255, 255);
+  pal[HEART] = rgb(255, 92, 146);
 
   for (int y = 0; y < LH; y++)
     for (int x = 0; x < LW; x++) {

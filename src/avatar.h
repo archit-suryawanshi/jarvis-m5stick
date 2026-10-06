@@ -3,7 +3,7 @@
 
 #include <M5Unified.h>
 
-enum class Mood { Idle, Listening, Thinking, Error, Sleepy };
+enum class Mood { Idle, Listening, Thinking, Error, Sleepy, Happy };
 
 // Size on screen: a 48x56 pixel-art sprite drawn at 2x.
 static const int AVATAR_W = 96, AVATAR_H = 112;
